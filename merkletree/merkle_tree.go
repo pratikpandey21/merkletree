@@ -2,15 +2,25 @@ package merkletree
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"errors"
+	"fmt"
 )
 
 // Node represents a node in the Merkle Tree
 type Node struct {
-	Hash  []byte
-	Data  []byte
-	Left  *Node
-	Right *Node
+	Hash   []byte
+	Data   []byte
+	Left   *Node
+	Right  *Node
+	Parent *Node
+	IsLeft bool
+}
+
+// ProofElement represents a single element in a Merkle proof with direction
+type ProofElement struct {
+	Hash   []byte
+	IsLeft bool // true if this hash should be on the left during verification
 }
 
 // MerkleTree represents the tree structure
@@ -49,19 +59,30 @@ func buildTreeRecursive(nodes []*Node) *Node {
 		return nodes[0]
 	}
 
-	// Handle odd number of nodes by duplicating the last one
-	if len(nodes)%2 == 1 {
-		nodes = append(nodes, nodes[len(nodes)-1])
-	}
+	// Create parent level
+	parentLevel := make([]*Node, 0, (len(nodes)+1)/2)
 
-	parentLevel := make([]*Node, 0)
-
-	// Build parent level
 	for i := 0; i < len(nodes); i += 2 {
 		left := nodes[i]
-		right := nodes[i+1]
+		var right *Node
 
-		combinedHash := append(left.Hash, right.Hash...)
+		// Handle odd number of nodes by duplicating the last one
+		if i+1 < len(nodes) {
+			right = nodes[i+1]
+		} else {
+			// Create a copy of the last node for odd-sized levels
+			right = &Node{
+				Hash: make([]byte, len(left.Hash)),
+				Data: nil, // Don't duplicate data, only hash
+			}
+			copy(right.Hash, left.Hash)
+		}
+
+		// Combine hashes (left || right)
+		combinedHash := make([]byte, 0, len(left.Hash)+len(right.Hash))
+		combinedHash = append(combinedHash, left.Hash...)
+		combinedHash = append(combinedHash, right.Hash...)
+
 		hash := sha256.Sum256(combinedHash)
 
 		parent := &Node{
@@ -70,6 +91,12 @@ func buildTreeRecursive(nodes []*Node) *Node {
 			Right: right,
 		}
 
+		// Set parent pointers and direction flags
+		left.Parent = parent
+		left.IsLeft = true
+		right.Parent = parent
+		right.IsLeft = false
+
 		parentLevel = append(parentLevel, parent)
 	}
 
@@ -77,82 +104,68 @@ func buildTreeRecursive(nodes []*Node) *Node {
 }
 
 // GenerateProof generates a membership proof for a leaf at given index
-func (mt *MerkleTree) GenerateProof(index int) ([][]byte, error) {
+func (mt *MerkleTree) GenerateProof(index int) ([]ProofElement, error) {
 	if index < 0 || index >= len(mt.Leaves) {
-		return nil, errors.New("index out of range")
+		return nil, fmt.Errorf("index %d out of range [0, %d)", index, len(mt.Leaves))
 	}
 
-	proof := make([][]byte, 0)
+	proof := make([]ProofElement, 0)
+	current := mt.Leaves[index]
 
-	// Navigate from leaf to root, collecting sibling hashes
-	currentIndex := index
-	currentLevel := mt.Leaves
+	// Navigate from leaf to root using parent pointers - O(log n)
+	for current.Parent != nil {
+		parent := current.Parent
+		var sibling *Node
 
-	for len(currentLevel) > 1 {
-		// Handle odd number of nodes
-		if len(currentLevel)%2 == 1 {
-			currentLevel = append(currentLevel, currentLevel[len(currentLevel)-1])
-		}
-
-		// Find sibling
-		var siblingIndex int
-		if currentIndex%2 == 0 {
-			siblingIndex = currentIndex + 1
+		// Get sibling node
+		if current.IsLeft {
+			sibling = parent.Right
 		} else {
-			siblingIndex = currentIndex - 1
+			sibling = parent.Left
 		}
 
-		proof = append(proof, currentLevel[siblingIndex].Hash)
+		// Add sibling to proof with correct direction
+		proof = append(proof, ProofElement{
+			Hash:   sibling.Hash,
+			IsLeft: !current.IsLeft, // Sibling's position relative to current
+		})
 
-		// Move to parent level
-		currentIndex = currentIndex / 2
-
-		// Rebuild parent level
-		parentLevel := make([]*Node, 0)
-		for i := 0; i < len(currentLevel); i += 2 {
-			parentLevel = append(parentLevel, findParent(currentLevel[i], currentLevel[i+1], mt.Root))
-		}
-		currentLevel = parentLevel
+		current = parent
 	}
 
 	return proof, nil
 }
 
-// findParent to find parent nodes
-func findParent(left, right, root *Node) *Node {
-	if root == nil {
-		return nil
-	}
-
-	if root.Left == left && root.Right == right {
-		return root
-	}
-
-	if found := findParent(left, right, root.Left); found != nil {
-		return found
-	}
-
-	return findParent(left, right, root.Right)
-}
-
 // VerifyProof verifies a membership proof
-func VerifyProof(dataBlock []byte, proof [][]byte, rootHash []byte) bool {
+func VerifyProof(dataBlock []byte, proof []ProofElement, rootHash []byte) bool {
+	if dataBlock == nil || rootHash == nil {
+		return false
+	}
+
+	// Start with hash of the data block
 	hash := sha256.Sum256(dataBlock)
 	currentHash := hash[:]
 
-	for _, siblingHash := range proof {
-		// We don't know if sibling is left or right!
+	// Apply each proof element with correct ordering
+	for _, element := range proof {
+		var combinedHash []byte
 
-		combinedHash1 := append(currentHash, siblingHash...)
-		hash1 := sha256.Sum256(combinedHash1)
+		if element.IsLeft {
+			// Sibling hash goes on the left
+			combinedHash = make([]byte, 0, len(element.Hash)+len(currentHash))
+			combinedHash = append(combinedHash, element.Hash...)
+			combinedHash = append(combinedHash, currentHash...)
+		} else {
+			// Sibling hash goes on the right
+			combinedHash = make([]byte, 0, len(currentHash)+len(element.Hash))
+			combinedHash = append(combinedHash, currentHash...)
+			combinedHash = append(combinedHash, element.Hash...)
+		}
 
-		combinedHash2 := append(siblingHash, currentHash...)
-		_ = sha256.Sum256(combinedHash2)
-
-		// We'll need to try both possibilities when verifying
-		// This is clearly not ideal!
-		currentHash = hash1[:]
+		hash := sha256.Sum256(combinedHash)
+		currentHash = hash[:]
 	}
 
-	return string(currentHash) == string(rootHash)
+	// Use constant-time comparison to prevent timing attacks
+	return subtle.ConstantTimeCompare(currentHash, rootHash) == 1
 }
